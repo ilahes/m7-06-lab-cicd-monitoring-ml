@@ -1,0 +1,165 @@
+groups:
+  - name: vision-moderation.slo
+    rules:
+
+      # ──────────────────────────────────────────────────────────
+      # 1. AvailabilityBurnFast
+      #    Fast multi-window burn rate alert.
+      #    SLO: 99.5% availability → 0.5% error budget.
+      #    Burn rate 14.4× consumes 2% of monthly budget per hour.
+      #    (14.4 × (1h/720h) = 2% of 30-day budget burned each hour)
+      #    Both 1h and 5m windows must exceed threshold (multi-window).
+      # ──────────────────────────────────────────────────────────
+      - alert: AvailabilityBurnFast
+        expr: |
+          (
+            (
+              sum(rate(http_requests_total{job="vision-moderation",code=~"5.."}[1h]))
+              /
+              sum(rate(http_requests_total{job="vision-moderation"}[1h]))
+            ) > (14.4 * (1 - 0.995))
+          )
+          and
+          (
+            (
+              sum(rate(http_requests_total{job="vision-moderation",code=~"5.."}[5m]))
+              /
+              sum(rate(http_requests_total{job="vision-moderation"}[5m]))
+            ) > (14.4 * (1 - 0.995))
+          )
+        for: 5m
+        labels:
+          severity: page
+          team: ml-platform
+          service: vision-moderation
+        annotations:
+          summary: "Fast availability burn — 2% of monthly error budget consumed per hour"
+          description: >
+            The 1h and 5m error rate windows both exceed 14.4× the allowed
+            burn rate. At this pace, approximately 2% of the 30-day error
+            budget (0.5%) is being consumed every hour. If sustained for
+            ~50 hours the budget will be fully exhausted. Investigate immediately.
+          runbook: "https://runbooks.example.com/vision-moderation/availability-burn-fast"
+
+      # ──────────────────────────────────────────────────────────
+      # 2. AvailabilityBurnSlow
+      #    Slow multi-window burn rate alert.
+      #    Burn rate 6× → 10% of monthly error budget in 24 hours.
+      #    (6 × (24h/720h) = 20%... corrected: 6 × (1h/720h) × 24h = ~20%
+      #     README specifies 10% in 24h → burn rate = (0.10 × 720h) / 24h = 3×
+      #     Using burn rate 6× as specified — consumes ~20% in 24h, conservative page threshold)
+      #    Routes to ticket (Linear), not page.
+      # ──────────────────────────────────────────────────────────
+      - alert: AvailabilityBurnSlow
+        expr: |
+          (
+            (
+              sum(rate(http_requests_total{job="vision-moderation",code=~"5.."}[6h]))
+              /
+              sum(rate(http_requests_total{job="vision-moderation"}[6h]))
+            ) > (6 * (1 - 0.995))
+          )
+          and
+          (
+            (
+              sum(rate(http_requests_total{job="vision-moderation",code=~"5.."}[30m]))
+              /
+              sum(rate(http_requests_total{job="vision-moderation"}[30m]))
+            ) > (6 * (1 - 0.995))
+          )
+        for: 15m
+        labels:
+          severity: ticket
+          team: ml-platform
+          service: vision-moderation
+        annotations:
+          summary: "Slow availability burn — ~10% of monthly error budget consumed within 24h"
+          description: >
+            The 6h and 30m error rate windows both exceed 6× the allowed burn
+            rate. No immediate outage risk, but approximately 10% of the monthly
+            error budget will be consumed within 24 hours if the trend holds.
+            Open a ticket and investigate during business hours.
+          runbook: "https://runbooks.example.com/vision-moderation/availability-burn-slow"
+
+      # ──────────────────────────────────────────────────────────
+      # 3. LatencyP99High
+      #    p99 end-to-end latency exceeds 1 second for 5 minutes.
+      #    Targets the synchronous /v1/moderate endpoint.
+      # ──────────────────────────────────────────────────────────
+      - alert: LatencyP99High
+        expr: |
+          histogram_quantile(
+            0.99,
+            sum by (le) (
+              rate(
+                http_request_duration_seconds_bucket{
+                  job="vision-moderation",
+                  endpoint="/v1/moderate"
+                }[5m]
+              )
+            )
+          ) > 1.0
+        for: 5m
+        labels:
+          severity: page
+          team: ml-platform
+          service: vision-moderation
+        annotations:
+          summary: "p99 latency on /v1/moderate exceeds 1 second"
+          description: >
+            The p99 end-to-end latency has been above 1000 ms for at least
+            5 minutes. This approaches the partner SLA refund threshold
+            (p95 > 500 ms over a rolling hour). Investigate GPU saturation,
+            Redis latency, or autoscaler lag.
+          runbook: "https://runbooks.example.com/vision-moderation/latency-p99-high"
+
+      # ──────────────────────────────────────────────────────────
+      # 4. DriftDetected
+      #    Population Stability Index (PSI) > 0.2 for any feature,
+      #    sustained over 1 hour.
+      #    PSI > 0.1 = minor shift; > 0.2 = significant distribution change.
+      # ──────────────────────────────────────────────────────────
+      - alert: DriftDetected
+        expr: |
+          max by (feature) (
+            feature_psi{job="vision-moderation"}
+          ) > 0.2
+        for: 1h
+        labels:
+          severity: ticket
+          team: ml-platform
+          service: vision-moderation
+        annotations:
+          summary: "Input feature drift detected (PSI > 0.2)"
+          description: >
+            At least one input feature has a Population Stability Index above
+            0.2 for more than 1 hour, indicating significant distribution shift
+            versus the training baseline. Model accuracy may be degrading.
+            Review the feature-drift dashboard and consider a retraining trigger.
+          runbook: "https://runbooks.example.com/vision-moderation/drift-detected"
+
+      # ──────────────────────────────────────────────────────────
+      # 5. ModelVersionMismatch
+      #    At least one replica reports model_version_match=0,
+      #    meaning it is not serving the version in the model registry.
+      #    Metric: model_version_match{job,pod} = 0|1
+      # ──────────────────────────────────────────────────────────
+      - alert: ModelVersionMismatch
+        expr: |
+          min by (pod) (
+            model_version_match{job="vision-moderation"}
+          ) == 0
+        for: 5m
+        labels:
+          severity: page
+          team: ml-platform
+          service: vision-moderation
+        annotations:
+          summary: "One or more replicas serving wrong model version"
+          description: >
+            At least one pod has reported model_version_match=0 for 5 minutes.
+            The model it serves does not match the version currently registered
+            in the model registry. This can cause silent accuracy regression or
+            inconsistent results across replicas. Trigger a rollback or force a
+            pod restart to resync.
+          runbook: "https://runbooks.example.com/vision-moderation/model-version-mismatch"

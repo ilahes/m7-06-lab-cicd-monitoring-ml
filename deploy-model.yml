@@ -1,0 +1,250 @@
+name: Deploy Vision Moderation Model
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  IMAGE: ghcr.io/${{ github.repository }}
+  SHA_TAG: ghcr.io/${{ github.repository }}:${{ github.sha }}
+
+jobs:
+  # ─────────────────────────────────────────────
+  # Stage 1: Lint OpenAPI spec + Dockerfile
+  # ─────────────────────────────────────────────
+  lint:
+    name: Lint
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Lint Dockerfile with hadolint
+        uses: hadolint/hadolint-action@v3.1.0
+        with:
+          dockerfile: Dockerfile
+          failure-threshold: warning
+
+      - name: Install Spectral for OpenAPI lint
+        run: npm install -g @stoplight/spectral-cli@6
+
+      - name: Lint OpenAPI spec
+        run: spectral lint openapi.yaml --ruleset .spectral.yaml
+
+  # ─────────────────────────────────────────────
+  # Stage 2: Unit + Contract tests
+  # ─────────────────────────────────────────────
+  test:
+    name: Test
+    runs-on: ubuntu-22.04
+    needs: lint
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Run unit tests
+        run: ./scripts/test-unit.sh
+
+      - name: Run contract tests
+        run: ./scripts/test-contract.sh
+
+  # ─────────────────────────────────────────────
+  # Stage 3: Build image, tag with git SHA
+  # ─────────────────────────────────────────────
+  build:
+    name: Build
+    runs-on: ubuntu-22.04
+    needs: test
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build image (no push yet)
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: false
+          tags: ${{ env.SHA_TAG }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          outputs: type=docker,dest=/tmp/image.tar
+
+      - name: Upload image tarball for downstream jobs
+        uses: actions/upload-artifact@v4
+        with:
+          name: docker-image
+          path: /tmp/image.tar
+          retention-days: 1
+
+  # ─────────────────────────────────────────────
+  # Stage 4: Trivy vulnerability scan
+  #          Fails on HIGH or CRITICAL CVEs
+  # ─────────────────────────────────────────────
+  scan:
+    name: Scan
+    runs-on: ubuntu-22.04
+    needs: build
+    steps:
+      - name: Download image tarball
+        uses: actions/download-artifact@v4
+        with:
+          name: docker-image
+          path: /tmp
+
+      - name: Load image into Docker daemon
+        run: docker load --input /tmp/image.tar
+
+      - name: Run Trivy vulnerability scan
+        uses: aquasecurity/trivy-action@0.18.0
+        with:
+          image-ref: ${{ env.SHA_TAG }}
+          format: table
+          exit-code: '1'
+          ignore-unfixed: true
+          severity: HIGH,CRITICAL
+          output: trivy-report.txt
+
+      - name: Upload Trivy report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: trivy-report
+          path: trivy-report.txt
+
+  # ─────────────────────────────────────────────
+  # Stage 5: Push image to GHCR
+  #          Only on push to main
+  # ─────────────────────────────────────────────
+  push:
+    name: Push
+    runs-on: ubuntu-22.04
+    needs: scan
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Download image tarball
+        uses: actions/download-artifact@v4
+        with:
+          name: docker-image
+          path: /tmp
+
+      - name: Load image into Docker daemon
+        run: docker load --input /tmp/image.tar
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Push image
+        run: |
+          docker push ${{ env.SHA_TAG }}
+          docker tag  ${{ env.SHA_TAG }} ${{ env.IMAGE }}:latest
+          docker push ${{ env.IMAGE }}:latest
+
+  # ─────────────────────────────────────────────
+  # Stage 6: Deploy to staging
+  # ─────────────────────────────────────────────
+  deploy-staging:
+    name: Deploy — Staging
+    runs-on: ubuntu-22.04
+    needs: push
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    environment: staging
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Deploy to staging
+        env:
+          IMAGE_TAG: ${{ github.sha }}
+          TARGET_ENV: staging
+        run: ./scripts/deploy.sh
+
+  # ─────────────────────────────────────────────
+  # Stage 7: Smoke test on staging
+  #          No `environment:` — must run without approval gate
+  # ─────────────────────────────────────────────
+  smoke-staging:
+    name: Smoke Test — Staging
+    runs-on: ubuntu-22.04
+    needs: deploy-staging
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Run smoke tests against staging
+        env:
+          TARGET_ENV: staging
+          IMAGE_TAG: ${{ github.sha }}
+        run: ./scripts/smoke.sh
+
+  # ─────────────────────────────────────────────
+  # Stage 8: Canary → full rollout to production
+  #          Requires manual approval via environment protection rule
+  #          FIX: canary failure triggers automatic rollback before full rollout
+  # ─────────────────────────────────────────────
+  deploy-production:
+    name: Deploy — Production
+    runs-on: ubuntu-22.04
+    needs: smoke-staging
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    environment: production
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Canary rollout — 10%
+        env:
+          IMAGE_TAG: ${{ github.sha }}
+          TARGET_ENV: production
+          CANARY_WEIGHT: "10"
+        run: ./scripts/deploy.sh
+
+      - name: Verify canary (10% traffic)
+        id: canary_verify
+        env:
+          IMAGE_TAG: ${{ github.sha }}
+          TARGET_ENV: production
+          CANARY_WEIGHT: "10"
+        run: ./scripts/canary-verify.sh
+
+      # FIX: Auto-rollback when canary-verify.sh exits non-zero
+      - name: Rollback canary on failure
+        if: failure() && steps.canary_verify.outcome == 'failure'
+        env:
+          IMAGE_TAG: ${{ github.sha }}
+          TARGET_ENV: production
+        run: |
+          echo "::error::Canary verification failed — initiating automatic rollback"
+          ./scripts/rollback.sh
+          exit 1
+
+      - name: Full rollout — 100%
+        env:
+          IMAGE_TAG: ${{ github.sha }}
+          TARGET_ENV: production
+          CANARY_WEIGHT: "100"
+        run: ./scripts/deploy.sh
+
+      - name: Post-deploy smoke test — production
+        env:
+          TARGET_ENV: production
+          IMAGE_TAG: ${{ github.sha }}
+        run: ./scripts/smoke.sh
